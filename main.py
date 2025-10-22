@@ -225,8 +225,14 @@ class AdaptiveExperimentDesignApp:
             self.scaler = StandardScaler()
             X_scaled = self.scaler.fit_transform(X)
 
-            # Обучаем модель (используем Random Forest как более robust метод)
-            self.current_model = RandomForestRegressor(n_estimators=100, random_state=42)
+            # Используем Gradient Boosting для лучшего обобщения
+            from sklearn.ensemble import GradientBoostingRegressor
+            self.current_model = GradientBoostingRegressor(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=3,
+                random_state=42
+            )
             self.current_model.fit(X_scaled, y)
 
             # Рассчитываем точность модели на имеющихся данных
@@ -234,7 +240,8 @@ class AdaptiveExperimentDesignApp:
 
             messagebox.showinfo("Модель обновлена",
                                 f"Модель успешно обучена!\nR² score: {score:.3f}\n"
-                                f"Обучено на {len(X)} опытах.")
+                                f"Обучено на {len(X)} опытах.\n"
+                                f"Использован Gradient Boosting для лучшего обобщения.")
 
         except Exception as e:
             messagebox.showerror("Ошибка", f"Ошибка при обучении модели: {str(e)}")
@@ -284,34 +291,63 @@ class AdaptiveExperimentDesignApp:
             # Получаем границы параметров
             bounds = self.get_parameter_bounds()
 
-            # Целевая функция для оптимизации
+            # Получаем уже проведенные опыты чтобы избежать дублирования
+            existing_points = self.get_existing_points()
+
+            # Целевая функция для оптимизации с штрафом за близость к существующим точкам
             def objective(x):
                 x_scaled = self.scaler.transform([x])
                 prediction = self.current_model.predict(x_scaled)[0]
 
+                # Штраф за близость к существующим точкам
+                penalty = 0
+                for existing_point in existing_points:
+                    distance = np.linalg.norm(np.array(x) - np.array(existing_point))
+                    if distance < 0.1:  # Штрафуем точки слишком близкие к существующим
+                        penalty += 100 * (0.1 - distance)
+
                 target_type = self.target_var.get()
                 if target_type == 'maximize':
-                    return -prediction  # Минимизируем отрицательное значение
+                    return -prediction + penalty
                 elif target_type == 'minimize':
-                    return prediction
+                    return prediction + penalty
                 else:  # target
                     target_val = float(self.target_value_var.get())
-                    return abs(prediction - target_val)
+                    return abs(prediction - target_val) + penalty
 
-            # Начальная точка - центр области
-            x0 = [(b[0] + b[1]) / 2 for b in bounds]
+            # Пробуем несколько случайных начальных точек
+            best_result = None
+            best_score = float('inf')
 
-            # Ограничения
-            constraints = []
-            for i, (low, high) in enumerate(bounds):
-                constraints.append({'type': 'ineq', 'fun': lambda x, i=i, l=low: x[i] - l})
-                constraints.append({'type': 'ineq', 'fun': lambda x, i=i, h=high: h - x[i]})
+            for attempt in range(10):
+                # Случайная начальная точка в пределах границ
+                x0 = [np.random.uniform(low, high) for low, high in bounds]
 
-            # Оптимизация
-            result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints)
+                # Ограничения
+                constraints = []
+                for i, (low, high) in enumerate(bounds):
+                    constraints.append({'type': 'ineq', 'fun': lambda x, i=i, l=low: x[i] - l})
+                    constraints.append({'type': 'ineq', 'fun': lambda x, i=i, h=high: h - x[i]})
 
-            if result.success:
-                suggested_params = result.x
+                # Оптимизация
+                result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints)
+
+                if result.success and result.fun < best_score:
+                    best_score = result.fun
+                    best_result = result
+
+            if best_result and best_result.success:
+                suggested_params = best_result.x
+
+                # Проверяем, что точка достаточно отличается от существующих
+                min_distance = min([np.linalg.norm(np.array(suggested_params) - np.array(point))
+                                    for point in existing_points]) if existing_points else float('inf')
+
+                if min_distance < 0.05:  # Если точка слишком близка к существующей
+                    messagebox.showinfo("Информация",
+                                        "Система не нашла существенно новых оптимальных параметров.\n"
+                                        "Рекомендуется провести больше опытов для улучшения модели.")
+                    return
 
                 # Создаем словарь параметров
                 param_dict = {name: float(value) for name, value in zip(self.param_names, suggested_params)}
@@ -323,6 +359,28 @@ class AdaptiveExperimentDesignApp:
 
         except Exception as e:
             messagebox.showerror("Ошибка", f"Ошибка при генерации предложения: {str(e)}")
+
+    def get_existing_points(self):
+        """Получение списка уже проведенных опытов"""
+        experiment_name = self.exp_name_var.get()
+
+        self.cursor.execute('''
+            SELECT parameters_values FROM experiment_results 
+            WHERE experiment_id = (SELECT id FROM experiments WHERE name = ?)
+        ''', (experiment_name,))
+
+        results = self.cursor.fetchall()
+        existing_points = []
+
+        for (params_json,) in results:
+            try:
+                params = json.loads(params_json)
+                point = [params[param] for param in self.param_names]
+                existing_points.append(point)
+            except:
+                continue
+
+        return existing_points
 
     def show_suggestion_dialog(self, suggested_params):
         """Диалог показа предложенных параметров"""
